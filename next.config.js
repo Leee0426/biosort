@@ -2,6 +2,9 @@
 const nextConfig = {
   // Remove or comment out this line
   // output: 'export',
+    experimental: {
+    turbo: false
+  },
   
   eslint: {
     ignoreDuringBuilds: true,
@@ -11,7 +14,7 @@ const nextConfig = {
     ignoreBuildErrors: true,
   },
   
-  webpack: (config) => {
+ webpack: (config, { buildId, dev, isServer, defaultLoaders, webpack }) => {
     config.resolve.fallback = {
       ...config.resolve.fallback,
       fs: false,
