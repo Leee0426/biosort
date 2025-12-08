@@ -7,6 +7,87 @@ import ProtectedRoute from '@/components/ProtectedRoute';
 import { supabase } from '@/lib/supabase';
 import { roboflowAPI } from '@/lib/roboflowAPI';
 
+// Utility functions for ESP32 communication
+const fetchESP32 = async (endpoint, options = {}) => {
+  const isProduction = process.env.NODE_ENV === 'production';
+  
+  let baseUrl;
+  
+  if (isProduction) {
+    // In production, use the proxy
+    baseUrl = '/api/esp32';
+  } else {
+    // In development, allow direct connection
+    if (typeof window !== 'undefined') {
+      const controllerIP = localStorage.getItem('controllerIP') || '192.168.1.101';
+      baseUrl = `http://${controllerIP}`;
+    } else {
+      // Server-side fallback
+      baseUrl = '/api/esp32';
+    }
+  }
+  
+  const url = `${baseUrl}/${endpoint}`;
+  
+  // Add timeout to prevent hanging requests
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    return await response.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    
+    // Handle specific errors
+    if (error.name === 'AbortError') {
+      throw new Error('Request timeout: ESP32 controller not responding');
+    }
+    
+    // For development, fall back to direct connection if proxy fails
+    if (!isProduction) {
+      console.log('Proxy failed, trying direct connection...');
+      const controllerIP = localStorage.getItem('controllerIP');
+      if (controllerIP) {
+        try {
+          const directUrl = `http://${controllerIP}/${endpoint}`;
+          const directResponse = await fetch(directUrl, {
+            ...options,
+            headers: {
+              'Content-Type': 'application/json',
+              ...options.headers,
+            },
+          });
+          
+          if (!directResponse.ok) {
+            throw new Error(`Direct connection failed: HTTP ${directResponse.status}`);
+          }
+          
+          return await directResponse.json();
+        } catch (directError) {
+          throw new Error(`Both proxy and direct connection failed: ${directError.message}`);
+        }
+      }
+    }
+    
+    throw error;
+  }
+};
+
 // Interface for detection with timestamp
 interface DetectionWithTime {
   class: string;
@@ -276,22 +357,17 @@ const HomePage: React.FC = () => {
   // ==================== BIN CAPACITY FUNCTIONS ====================
   
   const fetchBinCapacity = async () => {
-    if (!controllerIP) return;
-
     try {
-      const response = await fetch(`http://${controllerIP}/bins`);
-      if (response.ok) {
-        const data = await response.json();
-        setBinCapacity(data);
-        console.log('🗑️ Bin capacity updated:', data);
-        
-        // Check for full bins and add to history
-        if (data.bin1.state === 'Full' && !data.bin1.warningSent) {
-          setDetectionHistory(prev => ["🚨 Bin 1 (Recyclable) is FULL! Please empty it.", ...prev.slice(0, 9)]);
-        }
-        if (data.bin2.state === 'Full' && !data.bin2.warningSent) {
-          setDetectionHistory(prev => ["🚨 Bin 2 (Non-Bio) is FULL! Please empty it.", ...prev.slice(0, 9)]);
-        }
+      const data = await fetchESP32('bins');
+      setBinCapacity(data);
+      console.log('🗑️ Bin capacity updated:', data);
+      
+      // Check for full bins and add to history
+      if (data.bin1.state === 'Full' && !data.bin1.warningSent) {
+        setDetectionHistory(prev => ["🚨 Bin 1 (Recyclable) is FULL! Please empty it.", ...prev.slice(0, 9)]);
+      }
+      if (data.bin2.state === 'Full' && !data.bin2.warningSent) {
+        setDetectionHistory(prev => ["🚨 Bin 2 (Non-Bio) is FULL! Please empty it.", ...prev.slice(0, 9)]);
       }
     } catch (error) {
       console.error('Error fetching bin capacity:', error);
@@ -455,28 +531,28 @@ const HomePage: React.FC = () => {
 
   // Enhanced image error handler with better retry logic
   const handleImageError = useCallback((e: string | Event) => {
-  console.error('❌ Stream image failed to load:', e);
-  setDetectionHistory(prev => ["🔄 Stream connection failed - retrying...", ...prev.slice(0, 9)]);
-  
-  // Auto-retry the stream after a short delay
-  setTimeout(() => {
-    if (isStreaming && cameraIP && imageRef.current) {
-      console.log('🔄 Retrying stream connection...');
-      const timestamp = Date.now();
-      const random = Math.random().toString(36).substring(7);
-      
-      // Clear current src first
-      imageRef.current.src = '';
-      
-      // Set new src after a brief delay
-      setTimeout(() => {
-        if (imageRef.current) {
-          imageRef.current.src = `http://${cameraIP}/stream?t=${timestamp}&r=${random}`;
-        }
-      }, 100);
-    }
-  }, 3000);
-}, [isStreaming, cameraIP]); // This 
+    console.error('❌ Stream image failed to load:', e);
+    setDetectionHistory(prev => ["🔄 Stream connection failed - retrying...", ...prev.slice(0, 9)]);
+    
+    // Auto-retry the stream after a short delay
+    setTimeout(() => {
+      if (isStreaming && cameraIP && imageRef.current) {
+        console.log('🔄 Retrying stream connection...');
+        const timestamp = Date.now();
+        const random = Math.random().toString(36).substring(7);
+        
+        // Clear current src first
+        imageRef.current.src = '';
+        
+        // Set new src after a brief delay
+        setTimeout(() => {
+          if (imageRef.current) {
+            imageRef.current.src = `http://${cameraIP}/stream?t=${timestamp}&r=${random}`;
+          }
+        }, 100);
+      }
+    }, 3000);
+  }, [isStreaming, cameraIP]);
 
   // Enhanced image load handler
   const handleImageLoad = useCallback(() => {
@@ -568,7 +644,7 @@ const HomePage: React.FC = () => {
 
   // Bin Capacity Monitoring
   useEffect(() => {
-    if (sensorMonitoring && controllerIP) {
+    if (sensorMonitoring) {
       binCapacityIntervalRef.current = setInterval(() => {
         fetchBinCapacity();
       }, 2000); // Update every 2 seconds
@@ -583,66 +659,63 @@ const HomePage: React.FC = () => {
         binCapacityIntervalRef.current = null;
       }
     };
-  }, [sensorMonitoring, controllerIP]);
+  }, [sensorMonitoring]);
 
   // SIMPLIFIED Ultrasonic Sensor Monitoring - Object detection starts stream with 30s cooldown
   useEffect(() => {
-    if (!sensorMonitoring || !controllerIP) return;
+    if (!sensorMonitoring) return;
 
     console.log('🔍 Starting simplified ultrasonic monitoring...');
 
     const monitorSensor = async () => {
       try {
-        const response = await fetch(`http://${controllerIP}/sensor`);
-        if (response.ok) {
-          const data = await response.json();
-          setUltrasonicData(data);
-          
-          // Also fetch bin capacity data
-          await fetchBinCapacity();
-          
-          const now = Date.now();
-          const timeSinceLastStream = now - lastStreamStartRef.current;
-          const canStartStream = timeSinceLastStream > SENSOR_COOLDOWN;
+        const data = await fetchESP32('sensor');
+        setUltrasonicData(data);
+        
+        // Also fetch bin capacity data
+        await fetchBinCapacity();
+        
+        const now = Date.now();
+        const timeSinceLastStream = now - lastStreamStartRef.current;
+        const canStartStream = timeSinceLastStream > SENSOR_COOLDOWN;
 
-          console.log('📊 Sensor Data:', {
-            objectDetected: data.objectDetected,
-            distance: data.distance,
-            isStreaming,
-            canStartStream,
-            timeSinceLastStream: Math.round(timeSinceLastStream/1000) + 's',
-            cooldownRemaining: Math.max(0, Math.round((SENSOR_COOLDOWN - timeSinceLastStream)/1000)) + 's'
-          });
+        console.log('📊 Sensor Data:', {
+          objectDetected: data.objectDetected,
+          distance: data.distance,
+          isStreaming,
+          canStartStream,
+          timeSinceLastStream: Math.round(timeSinceLastStream/1000) + 's',
+          cooldownRemaining: Math.max(0, Math.round((SENSOR_COOLDOWN - timeSinceLastStream)/1000)) + 's'
+        });
 
-          // SIMPLE LOGIC: If object detected and not streaming and cooldown passed, start stream
-          if (data.objectDetected && !isStreaming && canStartStream) {
-            console.log('🎯 Object detected - Starting stream with 30s cooldown');
-            setDetectionHistory(prev => ["📹 Object detected - Starting stream", ...prev.slice(0, 9)]);
-            lastStreamStartRef.current = now;
-            startStream();
-          }
-          
-          // If no object detected and streaming for more than 5 seconds, consider stopping
-          if (!data.objectDetected && isStreaming && !streamTimeoutRef.current) {
-            console.log('💤 Object disappeared - Will stop stream soon');
-            streamTimeoutRef.current = setTimeout(() => {
-              // Only stop if still no object and not detecting
-              if (!isDetecting) {
-                console.log('⏹️ Object gone - Stopping stream');
-                stopStream();
-              }
-              streamTimeoutRef.current = null;
-            }, 5000);
-          }
-          
-          // Cancel stop timeout if object reappears
-          if (data.objectDetected && streamTimeoutRef.current) {
-            console.log('🔁 Object returned - Cancelling stream stop');
-            clearTimeout(streamTimeoutRef.current);
-            streamTimeoutRef.current = null;
-          }
-
+        // SIMPLE LOGIC: If object detected and not streaming and cooldown passed, start stream
+        if (data.objectDetected && !isStreaming && canStartStream) {
+          console.log('🎯 Object detected - Starting stream with 30s cooldown');
+          setDetectionHistory(prev => ["📹 Object detected - Starting stream", ...prev.slice(0, 9)]);
+          lastStreamStartRef.current = now;
+          startStream();
         }
+        
+        // If no object detected and streaming for more than 5 seconds, consider stopping
+        if (!data.objectDetected && isStreaming && !streamTimeoutRef.current) {
+          console.log('💤 Object disappeared - Will stop stream soon');
+          streamTimeoutRef.current = setTimeout(() => {
+            // Only stop if still no object and not detecting
+            if (!isDetecting) {
+              console.log('⏹️ Object gone - Stopping stream');
+              stopStream();
+            }
+            streamTimeoutRef.current = null;
+          }, 5000);
+        }
+        
+        // Cancel stop timeout if object reappears
+        if (data.objectDetected && streamTimeoutRef.current) {
+          console.log('🔁 Object returned - Cancelling stream stop');
+          clearTimeout(streamTimeoutRef.current);
+          streamTimeoutRef.current = null;
+        }
+
       } catch (error) {
         console.error('Error reading ultrasonic sensor:', error);
       }
@@ -660,7 +733,7 @@ const HomePage: React.FC = () => {
         streamTimeoutRef.current = null;
       }
     };
-  }, [sensorMonitoring, controllerIP, isStreaming, isDetecting]);
+  }, [sensorMonitoring, isStreaming, isDetecting]);
 
   // Improved detection interval management
   useEffect(() => {
@@ -723,22 +796,12 @@ const HomePage: React.FC = () => {
   // Controller status check
   useEffect(() => {
     const checkControllerStatus = async () => {
-      if (!controllerIP) {
-        setControllerStatus("🔌 Enter Controller IP");
-        return;
-      }
-      
       try {
-        const response = await fetch(`http://${controllerIP}/status`);
-        if (response.ok) {
-          setControllerStatus("✅ Controller Online");
-          setLastCommandSuccess(true);
-        } else {
-          setControllerStatus("❌ Controller Unreachable");
-          setLastCommandSuccess(false);
-        }
+        await fetchESP32('status');
+        setControllerStatus("✅ Controller Online");
+        setLastCommandSuccess(true);
       } catch (error) {
-        setControllerStatus("❌ Check IP/Network");
+        setControllerStatus("❌ Controller Unreachable");
         setLastCommandSuccess(false);
       }
     };
@@ -747,7 +810,7 @@ const HomePage: React.FC = () => {
     checkControllerStatus();
 
     return () => clearInterval(interval);
-  }, [controllerIP]);
+  }, []);
 
   // Initialize
   useEffect(() => {
@@ -996,7 +1059,7 @@ const HomePage: React.FC = () => {
 
   // Send detection result to ESP32 controller
   const sendDetectionToController = async (predictions: any[]) => {
-    if (!controllerIP || predictions.length === 0 || isInCooldown) return;
+    if (predictions.length === 0 || isInCooldown) return;
 
     try {
       const now = Date.now();
@@ -1088,41 +1151,23 @@ const HomePage: React.FC = () => {
   };
 
   const updateSensorData = async () => {
-    if (!controllerIP) return;
-
     try {
-      const response = await fetch(`http://${controllerIP}/sensor`);
-      if (response.ok) {
-        const data = await response.json();
-        setUltrasonicData(data);
-        setDetectionHistory(prev => ["📏 Sensor data updated", ...prev.slice(0, 9)]);
-      }
+      const data = await fetchESP32('sensor');
+      setUltrasonicData(data);
+      setDetectionHistory(prev => ["📏 Sensor data updated", ...prev.slice(0, 9)]);
     } catch (error) {
       console.error('Error reading ultrasonic sensor:', error);
     }
   };
 
   const forceDetection = async () => {
-    if (!controllerIP) {
-      alert('❌ Controller IP not set');
-      return;
-    }
-
     try {
-      const response = await fetch(`http://${controllerIP}/control`, {
+      await fetchESP32('control', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify({ command: 'force_detection' })
       });
-
-      if (response.ok) {
-        setDetectionHistory(prev => ["🔧 Force started detection window", ...prev.slice(0, 9)]);
-        alert('✅ Force started detection window');
-      } else {
-        throw new Error('Failed to force detection');
-      }
+      setDetectionHistory(prev => ["🔧 Force started detection window", ...prev.slice(0, 9)]);
+      alert('✅ Force started detection window');
     } catch (error) {
       console.error('Error forcing detection:', error);
       alert('❌ Failed to force detection');
@@ -1130,26 +1175,13 @@ const HomePage: React.FC = () => {
   };
 
   const resetDetection = async () => {
-    if (!controllerIP) {
-      alert('❌ Controller IP not set');
-      return;
-    }
-
     try {
-      const response = await fetch(`http://${controllerIP}/control`, {
+      await fetchESP32('control', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify({ command: 'reset_detection' })
       });
-
-      if (response.ok) {
-        setDetectionHistory(prev => ["🔄 Detection state reset", ...prev.slice(0, 9)]);
-        alert('✅ Detection state reset');
-      } else {
-        throw new Error('Failed to reset detection');
-      }
+      setDetectionHistory(prev => ["🔄 Detection state reset", ...prev.slice(0, 9)]);
+      alert('✅ Detection state reset');
     } catch (error) {
       console.error('Error resetting detection:', error);
       alert('❌ Failed to reset detection');
@@ -1157,31 +1189,21 @@ const HomePage: React.FC = () => {
   };
 
   const manualControl = async (command: string) => {
-    if (!controllerIP) {
-      alert('❌ Controller IP not set');
-      return;
-    }
-
     try {
-      const response = await fetch(`http://${controllerIP}/control`, {
+      await fetchESP32('control', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify({ command })
       });
-
-      if (response.ok) {
-        setLastCommandSuccess(true);
-        setControllerStatus("✅ Controller Online");
-        alert(`✅ Command sent: ${command}`);
-      } else {
-        throw new Error('Command failed');
-      }
+      setLastCommandSuccess(true);
+      setControllerStatus("✅ Controller Online");
+      alert(`✅ Command sent: ${command}`);
     } catch (error) {
       console.error('Command error:', error);
       setLastCommandSuccess(false);
       setControllerStatus("❌ Controller Unreachable");
+      
+      // Get the controller IP for error message
+      const controllerIP = localStorage.getItem('controllerIP') || '192.168.1.101';
       alert(`❌ Cannot reach controller at ${controllerIP}`);
     }
   };
@@ -1211,12 +1233,15 @@ const HomePage: React.FC = () => {
   };
 
   const testControllerConnection = async () => {
+    const controllerIP = localStorage.getItem('controllerIP');
+    
     if (!controllerIP) {
       alert('Please enter Controller IP first');
       return;
     }
     
     try {
+      // Try direct connection first
       const response = await fetch(`http://${controllerIP}/status`);
       
       if (response.ok) {
