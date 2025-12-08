@@ -34,7 +34,7 @@ async function handleProxyRequest(request, { params }) {
   const endpoint = Array.isArray(path) ? path.join('/') : path;
   
   // Get ESP32 IP from environment variable or default
-  const esp32IP = process.env.ESP32_CONTROLLER_IP || '192.168.1.101';
+  const esp32IP = process.env.ESP32_CONTROLLER_IP || '192.168.100.9';
   
   // Build the target URL
   const targetUrl = `http://${esp32IP}/${endpoint}`;
